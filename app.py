@@ -11,10 +11,6 @@ from flask import Flask, request, jsonify, render_template_string
 # ==========================================
 app = Flask(__name__)
 sys.setrecursionlimit(20000)
-
-# [윈도우 로컬 테스트용] Tesseract 경로 (서버/Docker에 올릴 땐 주석 처리하세요)
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
 # ==========================================
 # 2. HTML 프론트엔드 (편의상 여기에 포함)
 # ==========================================
