@@ -128,51 +128,64 @@ def extract_grid_from_image(img_stream):
     file_bytes = np.frombuffer(img_stream.read(), np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     
-    # 2. 최소 전처리: "배경만 지운다"
-    # 사과 그림(빨강/초록) 때문에 Tesseract가 헷갈릴 수 있으므로,
-    # 흑백으로 바꾸고 대비를 극대화(Threshold)하여 '흰 글씨'만 남깁니다.
+    # 2. 그레이스케일 변환
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Otsu 알고리즘: 배경과 글씨를 나누는 최적의 값을 자동으로 찾음
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 3. 이진화 (White vs Black 구분)
+    # 배경(255)과 글씨(255)는 흰색, 사과(0)는 검은색이 되도록 강하게 나눕니다.
+    # 180~200 이상을 흰색으로 잡습니다.
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
     
-    # 노이즈 제거 (점 같은 것 없애기) - 선택 사항
-    # binary = cv2.medianBlur(binary, 3) 
-
-    # 3. Tesseract에 통째로 전송
-    # --psm 6: 이미지를 하나의 균일한 텍스트 뭉치(Block)로 취급
+    # 4. [핵심] 배경 지우기 (Flood Fill)
+    # 이미지의 (0,0) 좌표는 무조건 배경(흰색)이라고 가정하고,
+    # 여기서부터 연결된 모든 흰색을 검은색(0)으로 칠해버립니다.
+    # 사과(검은색)가 벽 역할을 해서, 사과 속에 있는 글씨(흰색)에는 페인트가 닿지 않습니다.
+    
+    h, w = binary.shape
+    mask = np.zeros((h+2, w+2), np.uint8)
+    
+    # 배경 제거용 복사본 생성
+    flooded = binary.copy()
+    
+    # (0,0)에서 시작해 연결된 흰색을 검은색으로 채움
+    cv2.floodFill(flooded, mask, (0, 0), 0)
+    
+    # 만약 테두리가 잘려서 (0,0)이 사과일 수도 있으니, 네 귀퉁이를 다 시도합니다.
+    cv2.floodFill(flooded, mask, (w-1, 0), 0)
+    cv2.floodFill(flooded, mask, (0, h-1), 0)
+    cv2.floodFill(flooded, mask, (w-1, h-1), 0)
+    
+    # 이제 'flooded' 이미지에는 "사과 속의 흰 글씨"만 흰색으로 남고 나머지는 다 검은색입니다.
+    
+    # 5. 색상 반전
+    # Tesseract는 "흰 배경에 검은 글씨"를 좋아하므로 반전시킵니다.
+    final_img = cv2.bitwise_not(flooded)
+    
+    # 6. Tesseract 실행
     config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=123456789'
-    text = pytesseract.image_to_string(binary, config=config)
+    text = pytesseract.image_to_string(final_img, config=config)
     
-    # 4. 결과 파싱 (텍스트 -> 리스트)
-    # 공백, 줄바꿈 다 무시하고 오직 '숫자'만 싹 긁어모음
+    # 7. 숫자 추출 및 결과 정리
     all_digits = [int(char) for char in text if char.isdigit()]
     
     ROWS, COLS = 10, 17
-    target_count = ROWS * COLS # 170개
+    target_count = ROWS * COLS
     
-    print(f"인식된 숫자 개수: {len(all_digits)} / {target_count}")
+    print(f"🔎 찾은 숫자: {len(all_digits)}개")
     
-    # [보정 로직] 개수가 안 맞을 경우
     if len(all_digits) < target_count:
-        # 부족하면 뒤를 0으로 채움 (최소한 에러는 안 나게)
         all_digits += [0] * (target_count - len(all_digits))
     elif len(all_digits) > target_count:
-        # 넘치면(노이즈 인식) 앞에서부터 170개만 자름
         all_digits = all_digits[:target_count]
-    
-    # 1차원 리스트 -> 10x17 2차원 리스트로 변환
+        
     board = []
     for r in range(ROWS):
-        start = r * COLS
-        end = (r + 1) * COLS
-        board.append(all_digits[start:end])
+        board.append(all_digits[r*COLS : (r+1)*COLS])
         
-    # 결과 확인용으로 'binary' 이미지를 리턴해서 웹에서 인식 상태를 볼 수 있게 함
-    # (제대로 흑백 분리가 되었는지 확인하는 용도)
-    processed_preview = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    # 미리보기 이미지 생성 (제대로 배경이 지워졌는지 확인용)
+    preview_img = cv2.cvtColor(final_img, cv2.COLOR_GRAY2BGR)
     
-    return board, processed_preview
+    return board, preview_img
 # ==========================================
 # 4. 알고리즘 로직 (그래프 기반)
 # ==========================================
