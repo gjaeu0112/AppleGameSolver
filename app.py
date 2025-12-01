@@ -123,56 +123,107 @@ HTML_TEMPLATE = """
 # ==========================================
 import re
 
-def extract_grid_from_image(img_stream):
-    # 1. 이미지 읽기
+def extract_grid_precise(img_stream):
+    # 1. 이미지 로드 및 전처리
     file_bytes = np.frombuffer(img_stream.read(), np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    
-    # 2. 그레이스케일 변환
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # 3. 이진화 (White vs Black 구분)
-    # 배경(255)과 글씨(255)는 흰색, 사과(0)는 검은색이 되도록 강하게 나눕니다.
-    # 180~200 이상을 흰색으로 잡습니다.
-    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    # 이진화 (배경/글씨=흰색, 사과=검은색)
+    _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY)
     
-    # 4. [핵심] 배경 지우기 (Flood Fill)
-    # 이미지의 (0,0) 좌표는 무조건 배경(흰색)이라고 가정하고,
-    # 여기서부터 연결된 모든 흰색을 검은색(0)으로 칠해버립니다.
-    # 사과(검은색)가 벽 역할을 해서, 사과 속에 있는 글씨(흰색)에는 페인트가 닿지 않습니다.
-    
+    # 배경 지우기 (Flood Fill) -> 사과 속 글씨만 남김
     h, w = binary.shape
     mask = np.zeros((h+2, w+2), np.uint8)
-    
-    # 배경 제거용 복사본 생성
     flooded = binary.copy()
-    
-    # (0,0)에서 시작해 연결된 흰색을 검은색으로 채움
-    cv2.floodFill(flooded, mask, (0, 0), 0)
-    
-    # 만약 테두리가 잘려서 (0,0)이 사과일 수도 있으니, 네 귀퉁이를 다 시도합니다.
-    cv2.floodFill(flooded, mask, (w-1, 0), 0)
-    cv2.floodFill(flooded, mask, (0, h-1), 0)
+    cv2.floodFill(flooded, mask, (0,0), 0)
     cv2.floodFill(flooded, mask, (w-1, h-1), 0)
     
-    # 이제 'flooded' 이미지에는 "사과 속의 흰 글씨"만 흰색으로 남고 나머지는 다 검은색입니다.
-    
-    # 5. 색상 반전
-    # Tesseract는 "흰 배경에 검은 글씨"를 좋아하므로 반전시킵니다.
+    # 색상 반전 (흰 배경 검은 글씨)
     final_img = cv2.bitwise_not(flooded)
     
-    # 6. Tesseract 실행
-    config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=123456789'
-    text = pytesseract.image_to_string(final_img, config=config)
-    
-    # 7. 숫자 추출 및 결과 정리
-    all_digits = [int(char) for char in text if char.isdigit()]
-    
+    # 글씨 영역 타이트하게 크롭
+    temp_inv = cv2.bitwise_not(final_img)
+    points = cv2.findNonZero(temp_inv)
+    if points is not None:
+        bx, by, bw, bh = cv2.boundingRect(points)
+        final_img = final_img[by:by+bh, bx:bx+bw]
+        # 원본 이미지도 나중에 결과 그릴 때 쓰려고 같이 자름 (좌표 매칭용)
+        display_img = img[by:by+bh, bx:bx+bw]
+    else:
+        display_img = img
+
+    # ---------------------------------------------------------
+    # [핵심] 아틀라스(Atlas) 생성: 잘라서 새 판에 옮겨심기
+    # ---------------------------------------------------------
     ROWS, COLS = 10, 17
+    
+    # 원본에서의 셀 크기
+    cell_h = final_img.shape[0] / ROWS
+    cell_w = final_img.shape[1] / COLS
+    
+    # 새로 만들 캔버스 설정 (한 글자당 28x28 크기로 규격화 + 여백)
+    # 가로 간격을 넉넉히 줘서 숫자가 붙지 않게 함
+    NEW_W, NEW_H = 28, 28
+    GAP_X, GAP_Y = 15, 10
+    
+    canvas_width = COLS * (NEW_W + GAP_X)
+    canvas_height = ROWS * (NEW_H + GAP_Y)
+    
+    # 깨끗한 흰색 도화지 생성
+    atlas_canvas = np.full((canvas_height, canvas_width), 255, dtype=np.uint8)
+    
+    print("1. 이미지를 170조각으로 자르고 재배치 중...")
+    
+    for r in range(ROWS):
+        for c in range(COLS):
+            # 1) 원본에서 해당 칸 좌표 계산 (소수점 정밀도 유지하다가 자를 때 int 변환)
+            y1 = int(r * cell_h)
+            y2 = int((r + 1) * cell_h)
+            x1 = int(c * cell_w)
+            x2 = int((c + 1) * cell_w)
+            
+            # 2) 칸 오려내기
+            cell = final_img[y1:y2, x1:x2]
+            
+            # 3) 사과 껍질(테두리) 제거를 위해 안쪽만 살짝 파냄 (Crop Center)
+            ch, cw = cell.shape
+            if ch > 0 and cw > 0:
+                py, px = int(ch * 0.15), int(cw * 0.15) # 15%씩 파냄
+                cell = cell[py:ch-py, px:cw-px]
+            
+            # 4) 규격화 (28x28 리사이즈)
+            if cell.size > 0:
+                cell = cv2.resize(cell, (NEW_W, NEW_H))
+                # 이진화 한번 더 해서 선명하게 (흐릿한 잔상 제거)
+                _, cell = cv2.threshold(cell, 128, 255, cv2.THRESH_BINARY)
+            else:
+                cell = np.full((NEW_H, NEW_W), 255, dtype=np.uint8) # 빈칸이면 흰색
+            
+            # 5) 새 도화지(Atlas)의 정확한 위치에 풀로 붙이기
+            ty = r * (NEW_H + GAP_Y)
+            tx = c * (NEW_W + GAP_X)
+            atlas_canvas[ty:ty+NEW_H, tx:tx+NEW_W] = cell
+
+    # ---------------------------------------------------------
+    # OCR 실행 (딱 1번 호출)
+    # ---------------------------------------------------------
+    print("2. Tesseract OCR 1회 실행...")
+    # --psm 6: 하나의 균일한 텍스트 블록으로 인식
+    config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=123456789'
+    text = pytesseract.image_to_string(atlas_canvas, config=config)
+    
+    # 숫자만 추출
+    all_digits = [int(ch) for ch in text if ch.isdigit()]
+    
+    print(f"3. 인식된 숫자: {len(all_digits)}개 (목표: 170)")
+    
+    # ---------------------------------------------------------
+    # 데이터 보정 및 결과 반환
+    # ---------------------------------------------------------
     target_count = ROWS * COLS
     
-    print(f"🔎 찾은 숫자: {len(all_digits)}개")
-    
+    # 개수가 안 맞으면 0으로 채우거나 자름 (비상 대책)
     if len(all_digits) < target_count:
         all_digits += [0] * (target_count - len(all_digits))
     elif len(all_digits) > target_count:
@@ -181,11 +232,11 @@ def extract_grid_from_image(img_stream):
     board = []
     for r in range(ROWS):
         board.append(all_digits[r*COLS : (r+1)*COLS])
-        
-    # 미리보기 이미지 생성 (제대로 배경이 지워졌는지 확인용)
-    preview_img = cv2.cvtColor(final_img, cv2.COLOR_GRAY2BGR)
     
-    return board, preview_img
+    # 디버깅용 이미지 (재배치된 아틀라스 이미지를 보여줌 - 인식 잘 됐는지 확인 가능)
+    debug_img = cv2.cvtColor(atlas_canvas, cv2.COLOR_GRAY2BGR)
+    
+    return board, display_img, debug_img
 # ==========================================
 # 4. 알고리즘 로직 (그래프 기반)
 # ==========================================
