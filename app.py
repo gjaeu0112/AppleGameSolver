@@ -322,32 +322,40 @@ def solve():
         return jsonify({'error': '파일이 없습니다.'})
     
     try:
-        # 1. OCR
-        board, cropped_img = extract_grid_from_image(request.files['file'])
+        # 1. OCR 및 이미지 처리
+        board, processed_img = extract_grid_from_image(request.files['file'])
         
         # 2. 알고리즘 풀이
         score, rects = solve_puzzle(board)
         
-        # 3. 결과 그리기 (크롭된 이미지 위에)
-        result_img = cropped_img.copy()
+        # 3. 결과 그리기
+        # processed_img는 이제 타이트하게 잘린 이미지입니다.
+        result_img = processed_img.copy()
         h_img, w_img, _ = result_img.shape
-        cell_h = h_img // 10
-        cell_w = w_img // 17
         
+        # [수정] 소수점 단위로 정밀하게 셀 크기 계산
+        cell_h = h_img / 10.0
+        cell_w = w_img / 17.0
+        
+        # 직사각형 그리기
         for (r, c, h, w) in rects:
-            cv2.rectangle(result_img, 
-                          (c * cell_w, r * cell_h), 
-                          ((c + w) * cell_w, (r + h) * cell_h), 
-                          (0, 0, 255), 3) # 빨간색 테두리
-                          
-        # 4. 이미지 인코딩
+            # 좌표 계산 시 int()로 변환하여 픽셀 위치 확정
+            x1 = int(c * cell_w)
+            y1 = int(r * cell_h)
+            x2 = int((c + w) * cell_w)
+            y2 = int((r + h) * cell_h)
+            
+            # 빨간색 테두리 (두께 3)
+            cv2.rectangle(result_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
+
+        # 4. 이미지 인코딩해서 보내기
         _, buffer = cv2.imencode('.jpg', result_img)
         img_base64 = base64.b64encode(buffer).decode('utf-8')
         
         return jsonify({'score': score, 'image': img_base64})
         
     except Exception as e:
-        print(e)
+        print(f"Error: {e}")
         return jsonify({'error': str(e)})
 
 if __name__ == '__main__':
