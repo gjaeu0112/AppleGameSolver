@@ -122,58 +122,113 @@ HTML_TEMPLATE = """
 # 3. OCR 및 이미지 처리 로직
 # ==========================================
 def extract_grid_from_image(img_stream):
-    # 이미지 읽기
+    # ==========================================
+    # 1. 이미지 전처리 (공통)
+    # ==========================================
     file_bytes = np.frombuffer(img_stream.read(), np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     
-    # 전처리: 흰색 숫자만 남기기 (노이즈 제거)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
     
-    # 보드 영역 찾기 (흰색 픽셀들의 바운딩 박스)
     points = cv2.findNonZero(binary)
     if points is None:
-        raise ValueError("숫자를 찾을 수 없습니다.")
-        
-    x, y, w, h = cv2.boundingRect(points)
-    cropped = img[y:y+h, x:x+w] # 숫자 영역만 크롭
+        raise ValueError("숫자 영역을 찾을 수 없습니다.")
     
-    # 10x17 격자로 자르기
+    x, y, w, h = cv2.boundingRect(points)
+    cropped_img = img[y:y+h, x:x+w] # 결과 시각화용
+    processed_area = binary[y:y+h, x:x+w] # 인식용
+    
     ROWS, COLS = 10, 17
     cell_h = h // ROWS
     cell_w = w // COLS
     
-    board = []
+    # Tesseract 설정
+    config_block = r'--oem 3 --psm 6 -c tessedit_char_whitelist=123456789' # 뭉텅이 인식용
+    config_line  = r'--oem 3 --psm 7 -c tessedit_char_whitelist=123456789' # 한 줄 인식용
+    config_char  = r'--oem 3 --psm 10 -c tessedit_char_whitelist=123456789' # 한 글자 인식용
+
+    # ==========================================
+    # 2. [1단계] Fast Path: 전체 통으로 읽기 (가장 빠름)
+    # ==========================================
+    print("Attempt 1: One-shot scan...", end=" ")
     
-    # Tesseract 설정 (숫자만 인식)
-    config = r'--oem 3 --psm 10 -c tessedit_char_whitelist=123456789'
+    canvas_h = ROWS * 40 
+    canvas_w = COLS * 30
+    canvas = np.full((canvas_h, canvas_w), 255, dtype=np.uint8)
     
-    # OCR 수행
+    # 캔버스에 셀 옮겨심기 (재조립)
+    cells_map = [[None for _ in range(COLS)] for _ in range(ROWS)]
+    
     for r in range(ROWS):
-        row_data = []
         for c in range(COLS):
             cy, cx = r * cell_h, c * cell_w
-            # 여백을 주고 자르기 (인식률 향상)
-            margin_y, margin_x = int(cell_h * 0.1), int(cell_w * 0.1)
-            cell = cropped[cy+margin_y : cy+cell_h-margin_y, cx+margin_x : cx+cell_w-margin_x]
+            margin_y, margin_x = int(cell_h * 0.15), int(cell_w * 0.15)
+            cell = processed_area[cy+margin_y : cy+cell_h-margin_y, cx+margin_x : cx+cell_w-margin_x]
+            cell = cv2.resize(cell, (20, 28))
+            cell = cv2.bitwise_not(cell) # 반전 (검은 글씨)
             
-            # 전처리 (반전: 검은 글씨가 되도록, 혹은 그대로)
-            # 보통 Tesseract는 흰 배경 검은 글씨를 좋아함
-            cell_gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
-            _, cell_thresh = cv2.threshold(cell_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            cell_thresh = cv2.bitwise_not(cell_thresh) # 반전
+            # 나중에 재사용하기 위해 저장
+            cells_map[r][c] = cell
             
-            text = pytesseract.image_to_string(cell_thresh, config=config).strip()
-            
-            if text.isdigit():
-                row_data.append(int(text))
-            else:
-                # 인식 실패시 5로 가정 (가장 흔한 수) 혹은 에러 처리
-                row_data.append(0) 
-        board.append(row_data)
-        
-    return board, cropped
+            # 캔버스에 부착
+            target_y, target_x = r * 40 + 6, c * 30 + 5
+            canvas[target_y:target_y+28, target_x:target_x+20] = cell
 
+    text = pytesseract.image_to_string(canvas, config=config_block)
+    digits = [int(ch) for ch in text if ch.isdigit()]
+    
+    # 숫자가 정확히 170개라면 바로 성공!
+    if len(digits) == 170:
+        print("Success!")
+        board = []
+        for r in range(ROWS):
+            board.append(digits[r*COLS : (r+1)*COLS])
+        return board, cropped_img
+    
+    # ==========================================
+    # 3. [2단계] Retry Path: 행 단위로 다시 읽기 (더 정확함)
+    # ==========================================
+    print(f"Failed (Count: {len(digits)}). Switch to Row-by-Row scan.")
+    board = []
+    
+    for r in range(ROWS):
+        # 행 단위 이미지 생성 (H-Concat)
+        row_imgs = cells_map[r] # 위에서 잘라둔 셀 활용
+        
+        # 간격(여백)을 두고 가로로 이어 붙이기
+        row_strip = row_imgs[0]
+        for c in range(1, COLS):
+            # 구분선을 위한 흰색 여백 추가
+            spacer = np.full((28, 10), 255, dtype=np.uint8) 
+            row_strip = cv2.hconcat([row_strip, spacer, row_imgs[c]])
+            
+        text_row = pytesseract.image_to_string(row_strip, config=config_line)
+        row_digits = [int(ch) for ch in text_row if ch.isdigit()]
+        
+        # ==========================================
+        # 4. [3단계] Final Fallback: 칸 단위 읽기 (최후의 수단)
+        # ==========================================
+        # 행 단위 인식도 실패했다면(17개가 아니면), 그 행만 한 땀 한 땀 다시 읽음
+        if len(row_digits) != 17:
+            print(f"  -> Row {r} ambiguous. Switch to Cell-by-Cell.")
+            row_digits = []
+            for c in range(COLS):
+                # 개별 셀 인식 (--psm 10)
+                # 인식률 높이기 위해 테두리 여백을 좀 더 줌
+                cell_padded = cv2.copyMakeBorder(cells_map[r][c], 5, 5, 5, 5, cv2.BORDER_CONSTANT, value=[255])
+                char_text = pytesseract.image_to_string(cell_padded, config=config_char).strip()
+                
+                if char_text.isdigit():
+                    row_digits.append(int(char_text))
+                else:
+                    # 정말로 인식이 안 되면 어쩔 수 없이 0 처리 (혹은 5로 추정)
+                    # 하지만 psm 10은 거의 인식함
+                    row_digits.append(0) 
+        
+        board.append(row_digits)
+        
+    return board, cropped_img
 # ==========================================
 # 4. 알고리즘 로직 (그래프 기반)
 # ==========================================
